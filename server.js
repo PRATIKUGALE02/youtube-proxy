@@ -1,11 +1,15 @@
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
+import fs from "fs";
+import path from "path";
 
 const app = express();
 app.use(cors());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
+const DAILY_LIMIT = 10000;
+const QUOTA_FILE = path.resolve("quota.json");
 
 // --- YouTube Channels ---
 const CHANNELS = [
@@ -20,30 +24,53 @@ const CHANNELS = [
   { name: "Media Creation", id: "UCpZVGobfqofJaRHoLHLxcFA", key: "AIzaSyDT0Dr1sNyjXIsWpszKPqki6gU5wPKh9KQ" }
 ];
 
-// --- Quota Tracking Memory ---
-const DAILY_LIMIT = 10000;
-let quotaUsage = CHANNELS.map(() => 0);
-let lastReset = new Date().toISOString().split("T")[0];
+// --- Read/Write Quota File ---
+function readQuotaFile() {
+  try {
+    if (!fs.existsSync(QUOTA_FILE)) {
+      const newData = { date: today(), usage: CHANNELS.map(() => 0) };
+      fs.writeFileSync(QUOTA_FILE, JSON.stringify(newData, null, 2));
+      return newData;
+    }
 
-// Reset daily
-function checkReset() {
-  const today = new Date().toISOString().split("T")[0];
-  if (today !== lastReset) {
-    quotaUsage = CHANNELS.map(() => 0);
-    lastReset = today;
+    const data = JSON.parse(fs.readFileSync(QUOTA_FILE, "utf8"));
+    if (data.date !== today()) {
+      const reset = { date: today(), usage: CHANNELS.map(() => 0) };
+      fs.writeFileSync(QUOTA_FILE, JSON.stringify(reset, null, 2));
+      return reset;
+    }
+
+    return data;
+  } catch (e) {
+    console.error("Error reading quota file:", e);
+    return { date: today(), usage: CHANNELS.map(() => 0) };
   }
 }
 
-// --- YouTube Data Fetch ---
+function saveQuotaFile(data) {
+  fs.writeFileSync(QUOTA_FILE, JSON.stringify(data, null, 2));
+}
+
+function today() {
+  return new Date().toISOString().split("T")[0];
+}
+
+// --- Update quota ---
+function incrementQuota(index, cost = 1) {
+  const q = readQuotaFile();
+  q.usage[index] = (q.usage[index] || 0) + cost;
+  saveQuotaFile(q);
+}
+
+// --- API: Get YouTube stats ---
 app.get("/api/channels", async (req, res) => {
   try {
-    checkReset();
     const results = [];
+    const quota = readQuotaFile();
 
     for (let i = 0; i < CHANNELS.length; i++) {
       const ch = CHANNELS[i];
       const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id=${ch.id}&key=${ch.key}`;
-      quotaUsage[i] += 1; // Each request costs 1 unit
 
       const response = await fetch(url);
       const data = await response.json();
@@ -55,43 +82,40 @@ app.get("/api/channels", async (req, res) => {
         views: stats.viewCount || "N/A",
         videos: stats.videoCount || "N/A"
       });
+
+      incrementQuota(i, 1); // 1 API unit used
+      await new Promise(r => setTimeout(r, 80)); // delay to prevent quota spikes
     }
 
     res.json({ channels: results });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Failed to fetch data" });
+    res.status(500).json({ error: "Failed to fetch channel data" });
   }
 });
 
-// --- Quota Endpoint ---
+// --- API: Quota Tracker ---
 app.get("/api/quota", (req, res) => {
-  checkReset();
-  const quotaData = CHANNELS.map((ch, i) => ({
-    name: ch.name,
-    used: quotaUsage[i],
-    remaining: Math.max(0, DAILY_LIMIT - quotaUsage[i]),
-    status:
-      quotaUsage[i] > 9000
-        ? "red"
-        : quotaUsage[i] > 8000
-        ? "orange"
-        : "green"
-  }));
-
-  res.json({
-    date: lastReset,
-    daily_limit: DAILY_LIMIT,
-    channels: quotaData
+  const quota = readQuotaFile();
+  const channels = CHANNELS.map((ch, i) => {
+    const used = quota.usage[i];
+    const remaining = Math.max(0, DAILY_LIMIT - used);
+    const status =
+      remaining < 1000 ? "red" : remaining < 2000 ? "orange" : "green";
+    return { name: ch.name, used, remaining, status };
   });
+
+  res.json({ date: quota.date, daily_limit: DAILY_LIMIT, channels });
 });
 
-// --- Root Endpoint ---
+// --- Root ---
 app.get("/", (req, res) => {
   res.json({
-    message: "✅ YouTube Proxy Server is live",
+    message: "✅ YouTube Proxy + Real Quota Tracker is live",
     endpoints: ["/api/channels", "/api/quota"]
   });
 });
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+
+
