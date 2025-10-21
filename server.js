@@ -20,14 +20,35 @@ const CHANNELS = [
   { name: "Media Creation", id: "UCpZVGobfqofJaRHoLHLxcFA", key: "AIzaSyDT0Dr1sNyjXIsWpszKPqki6gU5wPKh9KQ" }
 ];
 
+// --- Quota Tracking Memory ---
+const DAILY_LIMIT = 10000;
+let quotaUsage = CHANNELS.map(() => 0);
+let lastReset = new Date().toISOString().split("T")[0];
+
+// Reset daily
+function checkReset() {
+  const today = new Date().toISOString().split("T")[0];
+  if (today !== lastReset) {
+    quotaUsage = CHANNELS.map(() => 0);
+    lastReset = today;
+  }
+}
+
+// --- YouTube Data Fetch ---
 app.get("/api/channels", async (req, res) => {
   try {
+    checkReset();
     const results = [];
-    for (const ch of CHANNELS) {
+
+    for (let i = 0; i < CHANNELS.length; i++) {
+      const ch = CHANNELS[i];
       const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id=${ch.id}&key=${ch.key}`;
+      quotaUsage[i] += 1; // Each request costs 1 unit
+
       const response = await fetch(url);
       const data = await response.json();
       const stats = data.items?.[0]?.statistics || {};
+
       results.push({
         name: ch.name,
         subscribers: stats.subscriberCount || "N/A",
@@ -35,6 +56,7 @@ app.get("/api/channels", async (req, res) => {
         videos: stats.videoCount || "N/A"
       });
     }
+
     res.json({ channels: results });
   } catch (error) {
     console.error(error);
@@ -42,5 +64,34 @@ app.get("/api/channels", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// --- Quota Endpoint ---
+app.get("/api/quota", (req, res) => {
+  checkReset();
+  const quotaData = CHANNELS.map((ch, i) => ({
+    name: ch.name,
+    used: quotaUsage[i],
+    remaining: Math.max(0, DAILY_LIMIT - quotaUsage[i]),
+    status:
+      quotaUsage[i] > 9000
+        ? "red"
+        : quotaUsage[i] > 8000
+        ? "orange"
+        : "green"
+  }));
 
+  res.json({
+    date: lastReset,
+    daily_limit: DAILY_LIMIT,
+    channels: quotaData
+  });
+});
+
+// --- Root Endpoint ---
+app.get("/", (req, res) => {
+  res.json({
+    message: "✅ YouTube Proxy Server is live",
+    endpoints: ["/api/channels", "/api/quota"]
+  });
+});
+
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
