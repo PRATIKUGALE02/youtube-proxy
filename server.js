@@ -24,26 +24,49 @@ const CHANNELS = [
   { name: "Media Creation", id: "UCpZVGobfqofJaRHoLHLxcFA", key: "AIzaSyDT0Dr1sNyjXIsWpszKPqki6gU5wPKh9KQ" }
 ];
 
-// --- Read/Write Quota File ---
+// --- Helper functions ---
+function today() {
+  return new Date().toISOString().split("T")[0];
+}
+function nowISO() {
+  return new Date().toISOString();
+}
+function hoursUntilReset() {
+  const now = new Date();
+  const endOfDay = new Date();
+  endOfDay.setUTCHours(23, 59, 59, 999);
+  const diffMs = endOfDay - now;
+  return Math.round(diffMs / (1000 * 60 * 60)); // hours
+}
+
+// --- Read / Write quota file ---
 function readQuotaFile() {
   try {
     if (!fs.existsSync(QUOTA_FILE)) {
-      const newData = { date: today(), usage: CHANNELS.map(() => 0) };
+      const newData = {
+        date: today(),
+        usage: CHANNELS.map(() => 0),
+        last_updated: nowISO()
+      };
       fs.writeFileSync(QUOTA_FILE, JSON.stringify(newData, null, 2));
       return newData;
     }
 
     const data = JSON.parse(fs.readFileSync(QUOTA_FILE, "utf8"));
     if (data.date !== today()) {
-      const reset = { date: today(), usage: CHANNELS.map(() => 0) };
+      const reset = {
+        date: today(),
+        usage: CHANNELS.map(() => 0),
+        last_updated: nowISO()
+      };
       fs.writeFileSync(QUOTA_FILE, JSON.stringify(reset, null, 2));
       return reset;
     }
 
     return data;
-  } catch (e) {
-    console.error("Error reading quota file:", e);
-    return { date: today(), usage: CHANNELS.map(() => 0) };
+  } catch (err) {
+    console.error("Error reading quota file:", err);
+    return { date: today(), usage: CHANNELS.map(() => 0), last_updated: nowISO() };
   }
 }
 
@@ -51,18 +74,14 @@ function saveQuotaFile(data) {
   fs.writeFileSync(QUOTA_FILE, JSON.stringify(data, null, 2));
 }
 
-function today() {
-  return new Date().toISOString().split("T")[0];
-}
-
-// --- Update quota ---
 function incrementQuota(index, cost = 1) {
   const q = readQuotaFile();
   q.usage[index] = (q.usage[index] || 0) + cost;
+  q.last_updated = nowISO();
   saveQuotaFile(q);
 }
 
-// --- API: Get YouTube stats ---
+// --- /api/channels ---
 app.get("/api/channels", async (req, res) => {
   try {
     const results = [];
@@ -83,18 +102,18 @@ app.get("/api/channels", async (req, res) => {
         videos: stats.videoCount || "N/A"
       });
 
-      incrementQuota(i, 1); // 1 API unit used
-      await new Promise(r => setTimeout(r, 80)); // delay to prevent quota spikes
+      incrementQuota(i, 1);
+      await new Promise(r => setTimeout(r, 80)); // small delay to avoid spam
     }
 
     res.json({ channels: results });
-  } catch (error) {
-    console.error(error);
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Failed to fetch channel data" });
   }
 });
 
-// --- API: Quota Tracker ---
+// --- /api/quota ---
 app.get("/api/quota", (req, res) => {
   const quota = readQuotaFile();
   const channels = CHANNELS.map((ch, i) => {
@@ -105,17 +124,21 @@ app.get("/api/quota", (req, res) => {
     return { name: ch.name, used, remaining, status };
   });
 
-  res.json({ date: quota.date, daily_limit: DAILY_LIMIT, channels });
+  res.json({
+    date: quota.date,
+    daily_limit: DAILY_LIMIT,
+    last_updated_time: quota.last_updated,
+    reset_in_hours: hoursUntilReset(),
+    channels
+  });
 });
 
 // --- Root ---
 app.get("/", (req, res) => {
   res.json({
-    message: "✅ YouTube Proxy + Real Quota Tracker is live",
+    message: "✅ YouTube Proxy + Real-Time Quota Tracker (with Reset Info)",
     endpoints: ["/api/channels", "/api/quota"]
   });
 });
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
-
-
