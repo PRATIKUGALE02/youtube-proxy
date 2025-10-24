@@ -3,6 +3,7 @@ import fetch from "node-fetch";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
+import { google } from "googleapis";
 
 const app = express();
 app.use(cors());
@@ -10,6 +11,21 @@ app.use(cors());
 const PORT = process.env.PORT || 10000;
 const DAILY_LIMIT = 10000;
 const QUOTA_FILE = path.resolve("quota.json");
+
+// --- Load OAuth credentials ---
+const CREDENTIALS_PATH = "client_secret.json";
+const TOKEN_PATH = "token.json";
+let oAuth2Client;
+
+if (fs.existsSync(CREDENTIALS_PATH)) {
+  const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, "utf8"));
+  const { client_id, client_secret, redirect_uris } = credentials.installed;
+  oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+  if (fs.existsSync(TOKEN_PATH)) {
+    const token = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
+    oAuth2Client.setCredentials(token);
+  }
+}
 
 // --- YouTube Channels ---
 const CHANNELS = [
@@ -24,22 +40,18 @@ const CHANNELS = [
   { name: "Media Creation", id: "UCpZVGobfqofJaRHoLHLxcFA", key: "AIzaSyDT0Dr1sNyjXIsWpszKPqki6gU5wPKh9KQ" }
 ];
 
-// --- Helper functions ---
-function today() {
-  return new Date().toISOString().split("T")[0];
-}
-function nowISO() {
-  return new Date().toISOString();
-}
+// --- Helper Functions ---
+function today() { return new Date().toISOString().split("T")[0]; }
+function nowISO() { return new Date().toISOString(); }
 function hoursUntilReset() {
   const now = new Date();
   const endOfDay = new Date();
   endOfDay.setUTCHours(23, 59, 59, 999);
   const diffMs = endOfDay - now;
-  return Math.round(diffMs / (1000 * 60 * 60)); // hours
+  return Math.round(diffMs / (1000 * 60 * 60));
 }
 
-// --- Read / Write quota file ---
+// --- Read / Write local quota file ---
 function readQuotaFile() {
   try {
     if (!fs.existsSync(QUOTA_FILE)) {
@@ -51,7 +63,6 @@ function readQuotaFile() {
       fs.writeFileSync(QUOTA_FILE, JSON.stringify(newData, null, 2));
       return newData;
     }
-
     const data = JSON.parse(fs.readFileSync(QUOTA_FILE, "utf8"));
     if (data.date !== today()) {
       const reset = {
@@ -62,7 +73,6 @@ function readQuotaFile() {
       fs.writeFileSync(QUOTA_FILE, JSON.stringify(reset, null, 2));
       return reset;
     }
-
     return data;
   } catch (err) {
     console.error("Error reading quota file:", err);
@@ -81,31 +91,25 @@ function incrementQuota(index, cost = 1) {
   saveQuotaFile(q);
 }
 
-// --- /api/channels ---
+// --- Local /api/channels ---
 app.get("/api/channels", async (req, res) => {
   try {
     const results = [];
-    const quota = readQuotaFile();
-
     for (let i = 0; i < CHANNELS.length; i++) {
       const ch = CHANNELS[i];
       const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id=${ch.id}&key=${ch.key}`;
-
       const response = await fetch(url);
       const data = await response.json();
       const stats = data.items?.[0]?.statistics || {};
-
       results.push({
         name: ch.name,
         subscribers: stats.subscriberCount || "N/A",
         views: stats.viewCount || "N/A",
         videos: stats.videoCount || "N/A"
       });
-
       incrementQuota(i, 1);
-      await new Promise(r => setTimeout(r, 80)); // small delay to avoid spam
+      await new Promise(r => setTimeout(r, 80));
     }
-
     res.json({ channels: results });
   } catch (err) {
     console.error(err);
@@ -113,14 +117,28 @@ app.get("/api/channels", async (req, res) => {
   }
 });
 
-// --- /api/quota ---
-app.get("/api/quota", (req, res) => {
+// --- Hybrid /api/quota (Local + Google Console) ---
+app.get("/api/quota", async (req, res) => {
   const quota = readQuotaFile();
+  let googleQuota = null;
+
+  try {
+    if (oAuth2Client) {
+      const projectNumber = "YOUR_PROJECT_NUMBER"; // Replace with actual GCP Project Number
+      const response = await fetch(
+        `https://serviceusage.googleapis.com/v1/projects/${projectNumber}/services/youtube.googleapis.com:consumerQuotaMetrics`,
+        { headers: { Authorization: `Bearer ${oAuth2Client.credentials.access_token}` } }
+      );
+      googleQuota = await response.json();
+    }
+  } catch (err) {
+    console.error("Google quota fetch failed:", err.message);
+  }
+
   const channels = CHANNELS.map((ch, i) => {
     const used = quota.usage[i];
     const remaining = Math.max(0, DAILY_LIMIT - used);
-    const status =
-      remaining < 1000 ? "red" : remaining < 2000 ? "orange" : "green";
+    const status = remaining < 1000 ? "red" : remaining < 2000 ? "orange" : "green";
     return { name: ch.name, used, remaining, status };
   });
 
@@ -129,15 +147,33 @@ app.get("/api/quota", (req, res) => {
     daily_limit: DAILY_LIMIT,
     last_updated_time: quota.last_updated,
     reset_in_hours: hoursUntilReset(),
-    channels
+    local_usage: channels,
+    google_console_quota: googleQuota || "Not authorized / Token missing"
   });
+});
+
+// --- OAuth Authorization Routes ---
+app.get("/api/authurl", (req, res) => {
+  if (!oAuth2Client) return res.json({ error: "No credentials file found" });
+  const SCOPES = ["https://www.googleapis.com/auth/cloud-platform.read-only"];
+  const url = oAuth2Client.generateAuthUrl({ access_type: "offline", scope: SCOPES });
+  res.json({ auth_url: url });
+});
+
+app.get("/api/oauth2callback", async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).send("Missing code");
+  const { tokens } = await oAuth2Client.getToken(code);
+  oAuth2Client.setCredentials(tokens);
+  fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
+  res.send("✅ Token saved successfully. You can close this window.");
 });
 
 // --- Root ---
 app.get("/", (req, res) => {
   res.json({
-    message: "✅ YouTube Proxy + Real-Time Quota Tracker (with Reset Info)",
-    endpoints: ["/api/channels", "/api/quota"]
+    message: "✅ YouTube Proxy + Real-Time Quota Tracker (Hybrid Mode)",
+    endpoints: ["/api/channels", "/api/quota", "/api/authurl", "/api/oauth2callback"]
   });
 });
 
